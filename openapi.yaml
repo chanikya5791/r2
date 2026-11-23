@@ -1,0 +1,215 @@
+openapi: 3.1.0
+info:
+  title: ShopLite Orders API
+  version: 1.0.0
+  description: |
+    Places and manages orders (Postgres). Prices and stock are checked against the Catalog API
+    when an order is placed. Each new order is published to Kafka as `order.created`, and the jobs
+    worker then moves it to PROCESSED (stock reserved) or FAILED. Cancelling publishes
+    `order.cancelled`. All endpoints except /health need a JWT from the Users API.
+servers:
+  - url: http://localhost:3002
+tags:
+  - name: orders
+  - name: health
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Health check (Postgres and Kafka; Catalog API is reported but does not fail the check)
+      responses:
+        '200':
+          description: Up
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Postgres or Kafka is down
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+  /orders:
+    post:
+      tags: [orders]
+      summary: Place an order
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Repeating a request with the same key returns the original order (200) instead of creating a new one.
+          schema: { type: string, minLength: 1, maxLength: 100 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrder' }
+      responses:
+        '201':
+          description: Order created with status PENDING
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '200':
+          description: Replay of an earlier request with the same Idempotency-Key (header Idempotent-Replayed true)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409':
+          description: INSUFFICIENT_STOCK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: PRODUCT_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: CATALOG_UNAVAILABLE or EVENTS_UNAVAILABLE
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      tags: [orders]
+      summary: List orders, newest first. Customers see their own; admins see all.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/OrderStatus' } }
+        - { name: userId, in: query, description: Admin only; ignored for customers, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderPage' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+  /orders/{id}:
+    get:
+      tags: [orders]
+      summary: Get an order (owner or admin)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /orders/{id}/cancel:
+    post:
+      tags: [orders]
+      summary: Cancel a PENDING or PROCESSED order (owner or admin)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409':
+          description: INVALID_STATUS (already CANCELLED or FAILED)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Health:
+      type: object
+      required: [status, service, checks]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        service: { type: string }
+        checks: { type: object, additionalProperties: { type: string, enum: [up, down] } }
+    OrderStatus:
+      type: string
+      enum: [PENDING, PROCESSED, FAILED, CANCELLED]
+    CreateOrder:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 20
+          description: Each productId may appear only once.
+          items:
+            type: object
+            required: [productId, quantity]
+            properties:
+              productId: { type: string, description: Catalog product id }
+              quantity: { type: integer, minimum: 1, maximum: 100 }
+    OrderLine:
+      type: object
+      required: [productId, sku, name, unitPriceCents, quantity, lineTotalCents]
+      additionalProperties: false
+      properties:
+        productId: { type: string }
+        sku: { type: string }
+        name: { type: string }
+        unitPriceCents: { type: integer, minimum: 1 }
+        quantity: { type: integer, minimum: 1 }
+        lineTotalCents: { type: integer, minimum: 1 }
+    Order:
+      type: object
+      required: [id, userId, status, totalCents, currency, failureReason, items, createdAt, updatedAt]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        totalCents: { type: integer, minimum: 0 }
+        currency: { type: string, const: USD }
+        failureReason:
+          type: [string, 'null']
+          description: e.g. INSUFFICIENT_STOCK (set by the jobs worker) or EVENT_PUBLISH_FAILED
+        items:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/OrderLine' }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    OrderPage:
+      type: object
+      required: [items, total, page, limit]
+      additionalProperties: false
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Order' } }
+        total: { type: integer, minimum: 0 }
+        page: { type: integer, minimum: 1 }
+        limit: { type: integer, minimum: 1 }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: {}
